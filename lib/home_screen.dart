@@ -1,9 +1,8 @@
 // lib/home_screen.dart
 import 'package:flutter/material.dart';
-// Correct import:
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:provider/provider.dart';
-import 'map_state.dart';
+import 'map_state.dart'; // Ensure MapState is imported
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -15,24 +14,24 @@ class HomeScreen extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(
         title: const Text('BikeLoop Generator'),
-        backgroundColor: Colors.deepPurple, // Example color change
+        backgroundColor: Colors.deepPurple,
         foregroundColor: Colors.white,
       ),
       body: Stack(
         children: [
-          // GoogleMap widget using the correct package
           GoogleMap(
+            // ... (keep existing GoogleMap parameters)
             initialCameraPosition: CameraPosition(
               target: mapState.initialCameraPosition ?? const LatLng(45.6770, -111.0429), // Bozeman fallback
-              zoom: 12.0, // Slightly zoomed out initially
+              zoom: 12.0,
             ),
             onMapCreated: mapState.onMapCreated,
             myLocationEnabled: true,
             myLocationButtonEnabled: true,
             markers: mapState.markers,
             polylines: mapState.polylines,
-            padding: const EdgeInsets.only(bottom: 210), // Adjust if needed
-            mapType: MapType.normal, // Can change to terrain, satellite etc.
+            padding: const EdgeInsets.only(bottom: 250), // Increase padding slightly
+            mapType: MapType.normal,
           ),
 
           // Controls Panel
@@ -43,7 +42,7 @@ class HomeScreen extends StatelessWidget {
             child: Container(
               padding: const EdgeInsets.all(16.0),
               decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.95), // Slightly transparent
+                color: Colors.white.withOpacity(0.95),
                 borderRadius: const BorderRadius.only(
                   topLeft: Radius.circular(18.0),
                   topRight: Radius.circular(18.0),
@@ -60,6 +59,7 @@ class HomeScreen extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   TextField(
+                    // ... (keep existing TextField parameters)
                     controller: mapState.distanceController,
                     keyboardType: const TextInputType.numberWithOptions(decimal: true),
                     decoration: const InputDecoration(
@@ -70,22 +70,34 @@ class HomeScreen extends StatelessWidget {
                       prefixIcon: Icon(Icons.map),
                     ),
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 10), // Reduced space
                   Row(
+                    // ... (keep existing Smart Loop Switch Row)
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       const Text('Smart Loop (match distance)', style: TextStyle(fontSize: 16)),
                       Switch(
                         value: mapState.isSmartMode,
-                        onChanged: mapState.isLoading ? null : (value) { // Disable during loading
+                        onChanged: mapState.isLoading ? null : (value) {
                           mapState.setSmartMode(value);
                         },
                       ),
                     ],
                   ),
-                  const SizedBox(height: 12),
+                  // *** NEW: Checkbox for Restaurant Feature ***
+                  CheckboxListTile(
+                    title: const Text("End near a restaurant?"),
+                    value: mapState.endNearRestaurant,
+                    onChanged: mapState.isLoading ? null : (bool? value) {
+                      mapState.setEndNearRestaurant(value ?? false);
+                    },
+                    dense: true, // Makes it more compact
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  const SizedBox(height: 10), // Reduced space
                   mapState.isLoading
                       ? const Padding(
+                    // ... (keep existing loading indicator)
                     padding: EdgeInsets.symmetric(vertical: 10.0),
                     child: Column(
                       children: [
@@ -96,6 +108,7 @@ class HomeScreen extends StatelessWidget {
                     ),
                   )
                       : ElevatedButton.icon(
+                    // ... (keep existing button)
                     icon: const Icon(Icons.directions_bike),
                     label: const Text('Generate Loop'),
                     style: ElevatedButton.styleFrom(
@@ -109,6 +122,7 @@ class HomeScreen extends StatelessWidget {
                   const SizedBox(height: 5),
                   if (mapState.errorMessage != null && !mapState.isLoading)
                     Padding(
+                      // ... (keep existing error message display)
                       padding: const EdgeInsets.only(top: 8.0),
                       child: Text(
                         mapState.errorMessage!,
@@ -150,7 +164,7 @@ class HomeScreen extends StatelessWidget {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(icon, color: Colors.deepPurple, size: 28),
+        Icon(icon, color: Colors.black, size: 28),
         const SizedBox(height: 4),
         Text(value, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),

@@ -2,8 +2,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'package:flutter/foundation.dart'; // For kIsWeb
 import 'package:flutter/material.dart';
-// Correct import for the package:
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
@@ -22,12 +22,16 @@ class MapState with ChangeNotifier {
   bool _isLoading = false;
   String? _errorMessage;
   Map<String, dynamic>? _routeInfo;
+  double _currentRadiusFactor = 1.0;
+
+  // *** NEW: State for restaurant feature ***
+  bool _endNearRestaurant = false;
+  LatLng? _finalRestaurantLocation; // Store found restaurant location
 
   // --- Public Getters ---
-  // Use Bozeman, MT as a fallback if location not yet available
   LatLng? get initialCameraPosition => _currentPosition != null
       ? LatLng(_currentPosition!.latitude, _currentPosition!.longitude)
-      : const LatLng(45.6770, -111.0429); // Bozeman approx LatLng
+      : const LatLng(45.6770, -111.0429); // Bozeman fallback
   Set<Marker> get markers => _markers;
   Set<Polyline> get polylines => _polylines;
   bool get isSmartMode => _isSmartMode;
@@ -35,15 +39,16 @@ class MapState with ChangeNotifier {
   String? get errorMessage => _errorMessage;
   Map<String, dynamic>? get routeInfo => _routeInfo;
   String get targetDistanceStr => _targetDistanceStr;
+  // *** NEW: Getter for restaurant checkbox ***
+  bool get endNearRestaurant => _endNearRestaurant;
 
-  // --- Controller ---
+
   final TextEditingController distanceController = TextEditingController(text: "10");
-
-  // --- Constants ---
   static const double _metersPerMile = 1609.34;
   static const int _maxRetriesSmartMode = 5;
+  static const double _radiusAdjustmentStep = 0.15;
 
-  // --- Initialization ---
+
   MapState() {
     _init();
     distanceController.addListener(() {
@@ -55,7 +60,6 @@ class MapState with ChangeNotifier {
     await _getCurrentLocation();
   }
 
-  // --- Methods ---
   void onMapCreated(GoogleMapController controller) {
     _mapController = controller;
     if (_currentPosition != null) {
@@ -68,7 +72,15 @@ class MapState with ChangeNotifier {
     notifyListeners();
   }
 
+  // *** NEW: Method to update restaurant preference ***
+  void setEndNearRestaurant(bool value) {
+    _endNearRestaurant = value;
+    notifyListeners();
+  }
+
+
   Future<void> _getCurrentLocation() async {
+    // ... (Keep existing code, ensure it sets _currentPosition) ...
     _isLoading = true;
     _errorMessage = null;
     notifyListeners();
@@ -78,31 +90,33 @@ class MapState with ChangeNotifier {
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
         if (permission == LocationPermission.denied) {
-          throw Exception(
-              "Location permissions are denied. Please enable them.");
+          throw Exception("Location permissions are denied. Please enable them.");
         }
       }
       if (permission == LocationPermission.deniedForever) {
-        throw Exception(
-            "Location permissions are permanently denied. Please enable them in settings.");
+        throw Exception("Location permissions are permanently denied. Please enable them in settings.");
       }
 
-      _currentPosition = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high);
+      _currentPosition = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+      print("Current Location: ${_currentPosition?.latitude}, ${_currentPosition?.longitude}");
 
       _markers.clear();
-      _markers.add(
-        Marker(
-          markerId: const MarkerId('start'),
-          position: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
-          infoWindow: const InfoWindow(title: 'Start/End'),
-          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
-        ),
-      );
-
-      if (_mapController != null) {
-        _animateToUser();
+      if (_currentPosition != null) {
+        _markers.add(
+          Marker(
+            markerId: const MarkerId('start'),
+            position: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+            infoWindow: const InfoWindow(title: 'Start/End'),
+            icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
+          ),
+        );
+        if (_mapController != null) {
+          _animateToUser();
+        }
+      } else {
+        throw Exception("Failed to get current position.");
       }
+
     } catch (e) {
       _errorMessage = "Error getting location: ${e.toString()}";
       print(_errorMessage);
@@ -125,28 +139,28 @@ class MapState with ChangeNotifier {
     }
   }
 
+
   Future<void> generateLoop() async {
-    // Reset previous state
     _isLoading = true;
     _errorMessage = null;
     _polylines.clear();
     _routeInfo = null;
-    _markers.removeWhere((m) => m.markerId.value != 'start'); // Keep only start marker
-    notifyListeners(); // Show loading, clear old route
+    _finalRestaurantLocation = null; // Reset restaurant location
+    _markers.removeWhere((m) => m.markerId.value != 'start');
+    _currentRadiusFactor = 1.0;
+    notifyListeners();
 
     if (_currentPosition == null) {
       _errorMessage = "Current location not available. Trying again...";
       notifyListeners();
       await _getCurrentLocation();
-      if (_currentPosition == null){
+      if (_currentPosition == null) {
         _errorMessage = "Failed to get current location. Please ensure location services are enabled and permissions granted.";
         _isLoading = false;
         notifyListeners();
         return;
       }
-      // If location is now available, proceed, otherwise error is already set
     }
-
 
     final double? targetDistMiles = double.tryParse(distanceController.text);
     if (targetDistMiles == null || targetDistMiles <= 0) {
@@ -157,22 +171,45 @@ class MapState with ChangeNotifier {
     }
     final double targetDistMeters = targetDistMiles * _metersPerMile;
 
-
     try {
       LatLng startPoint = LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
-      List<LatLng> waypoints;
+      List<LatLng> generatedWaypoints;
+      List<LatLng> finalWaypoints; // Waypoints used for Directions API
       Map<String, dynamic>? result;
       bool routeFound = false;
       int retries = 0;
 
       do {
-        waypoints = _generateWaypoints(startPoint, targetDistMeters);
-        // Ensure generated waypoints are cleared from markers on retry
-        if (retries > 0) {
-          _markers.removeWhere((m) => m.markerId.value.startsWith('wp_'));
-        }
-        result = await _getDirections(startPoint, startPoint, waypoints);
+        _markers.removeWhere((m) => m.markerId.value.startsWith('wp_') || m.markerId.value == 'restaurant');
 
+        // *** Generate structured waypoints ***
+        // Generate one less if we need to find a restaurant
+        int pointsToGenerate = _endNearRestaurant ? 2 : 3;
+        generatedWaypoints = _generateStructuredWaypoints(startPoint, targetDistMeters, _currentRadiusFactor, pointsToGenerate);
+
+        // Clone for modification if needed
+        finalWaypoints = List.from(generatedWaypoints);
+
+        // *** Find restaurant if requested ***
+        if (_endNearRestaurant && finalWaypoints.isNotEmpty) {
+          LatLng lastWp = finalWaypoints.removeLast(); // Use location of last planned point as search center
+          _finalRestaurantLocation = await _findNearbyRestaurant(lastWp);
+
+          if (_finalRestaurantLocation != null) {
+            finalWaypoints.add(_finalRestaurantLocation!); // Add restaurant location as final waypoint
+            print("Restaurant found near last waypoint: $_finalRestaurantLocation");
+          } else {
+            // Couldn't find restaurant, add original last waypoint back
+            finalWaypoints.add(lastWp);
+            print("Could not find nearby restaurant, using original last waypoint.");
+            // Optionally set an error message or warning here later
+          }
+        }
+
+        // Get Directions using the final waypoint list
+        result = await _getDirections(startPoint, startPoint, finalWaypoints);
+
+        // --- (Rest of the retry logic based on distance - same as before) ---
         if (result != null) {
           final double actualDistanceMeters = result['distance_meters'];
           if (!_isSmartMode) {
@@ -180,32 +217,41 @@ class MapState with ChangeNotifier {
           } else {
             double lowerBound = targetDistMeters * 0.9;
             double upperBound = targetDistMeters * 1.1;
+
             if (actualDistanceMeters >= lowerBound && actualDistanceMeters <= upperBound) {
               routeFound = true;
+              print("Smart Mode: Route found within tolerance! (${(actualDistanceMeters / _metersPerMile).toStringAsFixed(1)} mi)");
             } else {
-              print("Smart Mode Retry ${retries+1}: Target=${targetDistMeters.toStringAsFixed(0)}m, Actual=${actualDistanceMeters.toStringAsFixed(0)}m.");
+              if (actualDistanceMeters < lowerBound) {
+                _currentRadiusFactor += _radiusAdjustmentStep;
+                print("Smart Mode Retry ${retries + 1}: Route too short (${(actualDistanceMeters / _metersPerMile).toStringAsFixed(1)} mi). Increasing radius factor to ${_currentRadiusFactor.toStringAsFixed(2)}.");
+              } else {
+                _currentRadiusFactor -= _radiusAdjustmentStep;
+                if (_currentRadiusFactor < 0.1) _currentRadiusFactor = 0.1;
+                print("Smart Mode Retry ${retries + 1}: Route too long (${(actualDistanceMeters / _metersPerMile).toStringAsFixed(1)} mi). Decreasing radius factor to ${_currentRadiusFactor.toStringAsFixed(2)}.");
+              }
               retries++;
               await Future.delayed(const Duration(milliseconds: 150));
             }
           }
         } else {
-          // Error occurred in _getDirections, break loop
-          retries = _maxRetriesSmartMode; // Force exit
+          print("Smart Mode Retry ${retries + 1}: _getDirections failed (Status: ${_errorMessage ?? 'Unknown Error'}). Trying new points.");
+          retries++;
+          await Future.delayed(const Duration(milliseconds: 150));
         }
-      } while (!_isSmartMode && !routeFound || // Simple mode loop runs once if result is valid
-          _isSmartMode && !routeFound && retries < _maxRetriesSmartMode);
+      } while (!_isSmartMode && !routeFound || _isSmartMode && !routeFound && retries < _maxRetriesSmartMode);
 
-
+      // --- (Result Processing - same as before, but pass finalWaypoints) ---
       if (routeFound && result != null) {
-        _processRouteResult(result, waypoints); // Pass waypoints to add markers correctly
+        // Pass the final list of waypoints used (might include restaurant)
+        _processRouteResult(result, finalWaypoints);
         _animateToRouteBounds(result['bounds']);
-      } else if (_isSmartMode && !routeFound && result != null) {
-        _errorMessage = "Couldn't generate a loop close to the target distance (${(result['distance_meters'] / _metersPerMile).toStringAsFixed(1)} mi found). Try a different distance or Simple Mode.";
-      } else if (result == null) {
-        // Error message should already be set by _getDirections
-        if (_errorMessage == null) { // Fallback error
-          _errorMessage = "Failed to get route from Google Directions API.";
-        }
+      } else if (_isSmartMode && !routeFound) {
+        String finalDistMsg = result != null ? "Last attempt distance: ${(result['distance_meters'] / _metersPerMile).toStringAsFixed(1)} mi." : "Could not generate a valid route.";
+        _errorMessage = "Smart Loop failed after $retries attempts. $finalDistMsg Try a different distance or Simple Mode.";
+        print(_errorMessage);
+      } else if (result == null && _errorMessage == null) {
+        _errorMessage = "Failed to get route. Check network or API keys.";
       }
 
     } catch (e) {
@@ -213,52 +259,168 @@ class MapState with ChangeNotifier {
       print(_errorMessage);
     } finally {
       _isLoading = false;
-      notifyListeners(); // Update UI with result/error
+      notifyListeners();
     }
   }
 
-  List<LatLng> _generateWaypoints(LatLng start, double targetDistanceMeters) {
+  // *** NEW: Structured Waypoint Generation ***
+  List<LatLng> _generateStructuredWaypoints(LatLng start, double targetDistanceMeters, double radiusFactor, int numPoints) {
     final Random random = Random();
-    final int numPoints = 2 + random.nextInt(2); // 2 or 3 intermediate points
     final List<LatLng> waypoints = [];
-    final double radiusFraction = _isSmartMode ? 0.25 : 0.33;
-    final double roughRadiusMeters = (targetDistanceMeters * radiusFraction) / 2;
+
+    // Base radius calculation (remains a rough estimate)
+    final double baseRadiusFraction = 0.35; // Slightly larger fraction for structured
+    final double roughRadiusMeters = (targetDistanceMeters * baseRadiusFraction * radiusFactor) / 2;
+    final double minRadius = 200.0; // Min 200m
+    final double maxRadius = targetDistanceMeters * 0.8; // Max radius
+    final double adjustedRadius = roughRadiusMeters.clamp(minRadius, maxRadius);
+
+    print("Generating $numPoints structured waypoints with adjusted radius: ${adjustedRadius.toStringAsFixed(0)}m (Factor: ${radiusFactor.toStringAsFixed(2)})");
+
     const double earthRadius = 6371000.0;
+    double initialBearing = random.nextDouble() * 2 * pi; // Random start direction
+
+    // Define angular spread based on number of points
+    // Try to spread points somewhat evenly in a large arc
+    double totalArc = (pi * 1.5); // Spread points over ~270 degrees
+    double angleIncrement = totalArc / (numPoints + 1);
 
     for (int i = 0; i < numPoints; i++) {
-      double angle = random.nextDouble() * 2 * pi;
-      double distance = roughRadiusMeters * (0.5 + random.nextDouble() * 0.5);
+      // Calculate bearing for this point
+      double currentBearing = initialBearing + (angleIncrement * (i + 1));
+      // Vary distance slightly - maybe points further out are further along loop?
+      double distance = adjustedRadius * (0.6 + (random.nextDouble() * 0.4)); // Skew slightly further out
+
+      // Calculate LatLng based on bearing and distance
       double lat1Rad = vector.radians(start.latitude);
       double lon1Rad = vector.radians(start.longitude);
       double lat2Rad = asin(sin(lat1Rad) * cos(distance / earthRadius) +
-          cos(lat1Rad) * sin(distance / earthRadius) * cos(angle));
-      double lon2Rad = lon1Rad + atan2(sin(angle) * sin(distance / earthRadius) * cos(lat1Rad),
+          cos(lat1Rad) * sin(distance / earthRadius) * cos(currentBearing));
+      double lon2Rad = lon1Rad + atan2(sin(currentBearing) * sin(distance / earthRadius) * cos(lat1Rad),
           cos(distance / earthRadius) - sin(lat1Rad) * sin(lat2Rad));
       waypoints.add(LatLng(vector.degrees(lat2Rad), vector.degrees(lon2Rad)));
     }
     return waypoints;
   }
 
+  // *** NEW: Find Nearby Restaurant using Places API ***
+  Future<LatLng?> _findNearbyRestaurant(LatLng searchCenter) async {
+    // Places API Nearby Search URL
+    const String placesBaseUrl = "https://maps.googleapis.com/maps/api/place/nearbysearch/json";
+    // Search within ~1.5km radius of the last planned point
+    const double searchRadiusMeters = 1500;
 
-  Future<Map<String, dynamic>?> _getDirections(
-      LatLng origin, LatLng destination, List<LatLng> waypoints) async {
-    final String waypointsString = waypoints
-        .map((wp) => 'via:${wp.latitude},${wp.longitude}')
-        .join('|');
-    final Uri url = Uri.parse(
-        'https://maps.googleapis.com/maps/api/directions/json?'
-            'origin=${origin.latitude},${origin.longitude}'
-            '&destination=${destination.latitude},${destination.longitude}'
-            '&waypoints=optimize:true|$waypointsString'
-            '&mode=bicycling'
-            '&key=$googleApiKey');
+    final Map<String, String> queryParams = {
+      'location': '${searchCenter.latitude},${searchCenter.longitude}',
+      'radius': searchRadiusMeters.toString(),
+      'type': 'restaurant',
+      'opennow': 'true', // Optional: prefer currently open places
+      'key': googleApiKey, // Use the Places API key
+      'rankby': 'prominence' // Rank by prominence within the radius
+    };
 
-    print("Directions API URL: $url");
+    // Handle CORS for Places API if needed (same logic as Directions)
+    const bool useCorsProxy = kIsWeb; // Use proxy only on web
+    const String corsProxy = "https://cors-anywhere.herokuapp.com/"; // Example only
+
+    Uri url;
+    if (useCorsProxy) {
+      final String googleUrl = Uri.https('maps.googleapis.com', '/maps/api/place/nearbysearch/json', queryParams).toString();
+      url = Uri.parse(corsProxy + googleUrl.substring(8));
+    } else {
+      url = Uri.https('maps.googleapis.com', '/maps/api/place/nearbysearch/json', queryParams);
+    }
+
+    print("Places API URL: $url");
 
     try {
       final response = await http.get(url);
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
+        if (useCorsProxy && response.body.contains("Missing required request header")) {
+          _errorMessage = "CORS Proxy Error (Places API): Missing required headers.";
+          print(_errorMessage);
+          return null;
+        }
+
+        if ((data['status'] == 'OK' || data['status'] == 'ZERO_RESULTS') && data['results'] != null) {
+          if (data['results'].isNotEmpty) {
+            // Pick the first result (most prominent)
+            final place = data['results'][0];
+            final location = place['geometry']['location'];
+            return LatLng(location['lat'], location['lng']);
+          } else {
+            print("Places API: Zero results found for restaurants nearby.");
+            _errorMessage = "No open restaurants found near the end of the loop."; // Set temporary error
+            return null;
+          }
+        } else {
+          _errorMessage = "Places API Error: ${data['status']} ${data['error_message'] ?? ''}";
+          print(_errorMessage);
+          return null;
+        }
+      } else {
+        _errorMessage = "Places API HTTP Error: ${response.statusCode} ${response.reasonPhrase}";
+        if (!useCorsProxy && (response.statusCode == 0 || response.statusCode == null)) {
+          _errorMessage = "Places API Network Error (Code ${response.statusCode}): Potential CORS issue on web.";
+        }
+        print(_errorMessage);
+        return null;
+      }
+    } catch (e) {
+      _errorMessage = "Places API Network/Parsing Error: ${e.toString()}";
+      if (!useCorsProxy && (e.toString().toLowerCase().contains('cors') || e.toString().toLowerCase().contains('xmlhttprequest'))) {
+        _errorMessage = "Places API Network Error: Likely a CORS issue on web. Needs backend proxy.";
+      }
+      print(_errorMessage);
+      return null;
+    }
+  }
+
+
+  // *** MODIFIED: Remove optimize:true from waypoints parameter ***
+  Future<Map<String, dynamic>?> _getDirections(
+      LatLng origin, LatLng destination, List<LatLng> waypoints) async {
+
+    // (CORS Proxy logic remains the same as previous answer - useCorsProxy flag)
+    const bool useCorsProxy = kIsWeb; // Set based on target platform/strategy
+    const String corsProxy = "https://cors-anywhere.herokuapp.com/";
+
+    // *** Construct waypoints string WITHOUT optimize:true ***
+    final String waypointsString = waypoints
+        .map((wp) => 'via:${wp.latitude},${wp.longitude}')
+        .join('|');
+
+    final Map<String, String> queryParams = {
+      'origin': '${origin.latitude},${origin.longitude}',
+      'destination': '${destination.latitude},${destination.longitude}',
+      // *** Only include waypoints if list is not empty ***
+      if (waypointsString.isNotEmpty) 'waypoints': waypointsString,
+      'mode': 'bicycling',
+      'key': googleApiKey,
+    };
+
+    Uri url;
+    if (useCorsProxy) {
+      final String googleUrl = Uri.https('maps.googleapis.com', '/maps/api/directions/json', queryParams).toString();
+      url = Uri.parse(corsProxy + googleUrl.substring(8));
+    } else {
+      url = Uri.https('maps.googleapis.com', '/maps/api/directions/json', queryParams);
+    }
+
+    print("Directions API URL (No Optimize): $url");
+
+    try {
+      // (Rest of the http.get and response handling is the same as previous answer)
+      final response = await http.get(url);
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (useCorsProxy && response.body.contains("Missing required request header")) {
+          _errorMessage = "CORS Proxy Error (Directions): Missing required headers.";
+          print(_errorMessage);
+          return null;
+        }
+        // ... (handle OK, ZERO_RESULTS, other statuses)
         if (data['status'] == 'OK' && data['routes'].isNotEmpty) {
           final route = data['routes'][0];
           int totalDistanceMeters = 0;
@@ -281,18 +443,29 @@ class MapState with ChangeNotifier {
             'turns': totalTurns,
             'bounds': bounds,
           };
+
         } else {
           _errorMessage = "Directions API Error: ${data['status']} ${data['error_message'] ?? ''}";
+          if (data['status'] == 'ZERO_RESULTS') {
+            _errorMessage = "Directions API Error: Could not find a bike route for the generated points.";
+          }
           print(_errorMessage);
           return null;
         }
+
       } else {
-        _errorMessage = "HTTP Error: ${response.statusCode} ${response.reasonPhrase}";
+        _errorMessage = "Directions HTTP Error: ${response.statusCode} ${response.reasonPhrase}";
+        if (!useCorsProxy && (response.statusCode == 0 || response.statusCode == null)) {
+          _errorMessage = "Directions Network Error (Code ${response.statusCode}): Potential CORS issue on web.";
+        }
         print(_errorMessage);
         return null;
       }
     } catch (e) {
-      _errorMessage = "Network or parsing error: ${e.toString()}";
+      _errorMessage = "Directions Network/Parsing Error: ${e.toString()}";
+      if (!useCorsProxy && (e.toString().toLowerCase().contains('cors') || e.toString().toLowerCase().contains('xmlhttprequest'))) {
+        _errorMessage = "Directions Network Error: Likely a CORS issue on web. Needs backend proxy.";
+      }
       print(_errorMessage);
       return null;
     }
@@ -304,10 +477,12 @@ class MapState with ChangeNotifier {
 
     Polyline routePolyline = Polyline(
       polylineId: const PolylineId('route'),
-      color: Colors.blue,
+      color: Colors.blueAccent, // Changed color slightly
       points: polylineCoordinates,
       width: 5,
     );
+    // Clear previous polylines before adding new one
+    _polylines.clear();
     _polylines.add(routePolyline);
 
     _routeInfo = {
@@ -316,13 +491,20 @@ class MapState with ChangeNotifier {
       'turns': result['turns'],
     };
 
-    // Add markers for the intermediate waypoints
+    // Add markers for the intermediate waypoints used (excluding start/end)
     for (int i = 0; i < waypoints.length; i++) {
+      // Check if this waypoint is the restaurant location
+      bool isRestaurant = _finalRestaurantLocation != null &&
+          waypoints[i].latitude == _finalRestaurantLocation!.latitude &&
+          waypoints[i].longitude == _finalRestaurantLocation!.longitude;
+
       _markers.add(Marker(
-        markerId: MarkerId('wp_$i'),
+        markerId: MarkerId(isRestaurant ? 'restaurant' : 'wp_$i'),
         position: waypoints[i],
-        infoWindow: InfoWindow(title: 'Point ${i + 1}'),
-        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueOrange),
+        infoWindow: InfoWindow(title: isRestaurant ? 'Restaurant Stop' : 'Point ${i + 1}'),
+        icon: BitmapDescriptor.defaultMarkerWithHue(
+            isRestaurant ? BitmapDescriptor.hueViolet : BitmapDescriptor.hueOrange
+        ),
       ));
     }
   }
@@ -330,7 +512,7 @@ class MapState with ChangeNotifier {
   void _animateToRouteBounds(LatLngBounds bounds) {
     if (_mapController != null) {
       _mapController!.animateCamera(
-          CameraUpdate.newLatLngBounds(bounds, 60.0) // Increased padding
+          CameraUpdate.newLatLngBounds(bounds, 60.0)
       );
     }
   }
