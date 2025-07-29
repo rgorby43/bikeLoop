@@ -4,10 +4,10 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/foundation.dart'; // For kIsWeb
 import 'package:flutter/material.dart';
+import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
-import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:vector_math/vector_math.dart' as vector;
 import 'secrets.dart';
 
@@ -85,15 +85,14 @@ class MapState with ChangeNotifier {
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
         if (permission == LocationPermission.denied) {
-          throw Exception("Location permissions are denied. Please enable them.");
+          throw Exception("Location permissions are denied.");
         }
       }
       if (permission == LocationPermission.deniedForever) {
-        throw Exception("Location permissions are permanently denied. Please enable them in settings.");
+        throw Exception("Location permissions are permanently denied.");
       }
 
       _currentPosition = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
-      print("Current Location: ${_currentPosition?.latitude}, ${_currentPosition?.longitude}");
 
       _markers.clear();
       if (_currentPosition != null) {
@@ -113,8 +112,7 @@ class MapState with ChangeNotifier {
       }
 
     } catch (e) {
-      _errorMessage = "Error getting location: ${e.toString()}";
-      print(_errorMessage);
+      _errorMessage = e.toString();
     } finally {
       _isLoading = false;
       notifyListeners();
@@ -145,11 +143,9 @@ class MapState with ChangeNotifier {
     notifyListeners();
 
     if (_currentPosition == null) {
-      _errorMessage = "Current location not available. Trying again...";
-      notifyListeners();
       await _getCurrentLocation();
       if (_currentPosition == null) {
-        _errorMessage = "Failed to get current location. Please ensure location services are enabled and permissions granted.";
+        _errorMessage = "Could not get your location. Please enable location services.";
         _isLoading = false;
         notifyListeners();
         return;
@@ -158,7 +154,7 @@ class MapState with ChangeNotifier {
 
     final double? targetDistMiles = double.tryParse(distanceController.text);
     if (targetDistMiles == null || targetDistMiles <= 0) {
-      _errorMessage = "Please enter a valid positive distance.";
+      _errorMessage = "Please enter a valid distance.";
       _isLoading = false;
       notifyListeners();
       return;
@@ -179,14 +175,12 @@ class MapState with ChangeNotifier {
         int pointsToGenerate = _endNearRestaurant ? 2 : 3;
         generatedWaypoints = _generateStructuredWaypoints(startPoint, targetDistMeters, _currentRadiusFactor, pointsToGenerate);
 
-        // --- NEW: Snap generated points to the nearest roads ---
         final List<LatLng>? snappedWaypoints = await _snapWaypointsToRoads(generatedWaypoints);
 
         if (snappedWaypoints == null) {
           retries++;
-          print("Waypoint snapping failed. Retrying...");
           await Future.delayed(const Duration(milliseconds: 150));
-          continue; // Skip to the next iteration of the loop
+          continue;
         }
 
         finalWaypoints = List.from(snappedWaypoints);
@@ -197,10 +191,8 @@ class MapState with ChangeNotifier {
 
           if (_finalRestaurantLocation != null) {
             finalWaypoints.add(_finalRestaurantLocation!);
-            print("Restaurant found near last waypoint: $_finalRestaurantLocation");
           } else {
             finalWaypoints.add(lastWp);
-            print("Could not find nearby restaurant, using original last waypoint.");
           }
         }
 
@@ -216,22 +208,18 @@ class MapState with ChangeNotifier {
 
             if (actualDistanceMeters >= lowerBound && actualDistanceMeters <= upperBound) {
               routeFound = true;
-              print("Smart Mode: Route found within tolerance! (${(actualDistanceMeters / _metersPerMile).toStringAsFixed(1)} mi)");
             } else {
               if (actualDistanceMeters < lowerBound) {
                 _currentRadiusFactor += _radiusAdjustmentStep;
-                print("Smart Mode Retry ${retries + 1}: Route too short (${(actualDistanceMeters / _metersPerMile).toStringAsFixed(1)} mi). Increasing radius factor to ${_currentRadiusFactor.toStringAsFixed(2)}.");
               } else {
                 _currentRadiusFactor -= _radiusAdjustmentStep;
                 if (_currentRadiusFactor < 0.1) _currentRadiusFactor = 0.1;
-                print("Smart Mode Retry ${retries + 1}: Route too long (${(actualDistanceMeters / _metersPerMile).toStringAsFixed(1)} mi). Decreasing radius factor to ${_currentRadiusFactor.toStringAsFixed(2)}.");
               }
               retries++;
               await Future.delayed(const Duration(milliseconds: 150));
             }
           }
         } else {
-          print("Smart Mode Retry ${retries + 1}: _getDirections failed (Status: ${_errorMessage ?? 'Unknown Error'}). Trying new points.");
           retries++;
           await Future.delayed(const Duration(milliseconds: 150));
         }
@@ -240,19 +228,17 @@ class MapState with ChangeNotifier {
       if (routeFound && result != null) {
         _processRouteResult(result, finalWaypoints);
         _animateToRouteBounds(result['bounds']);
-      } else if (_isSmartMode && !routeFound) {
-        String finalDistMsg = result != null ? "Last attempt distance: ${(result['distance_meters'] / _metersPerMile).toStringAsFixed(1)} mi." : "Could not generate a valid route.";
-        _errorMessage = "Smart Loop failed after $retries attempts. $finalDistMsg Try a different distance or Simple Mode.";
-        print(_errorMessage);
-      } else if (result == null && _errorMessage == null) {
-        _errorMessage = "Failed to get route. Check network or API keys.";
+      } else {
+        // --- UPDATED: Final error message ---
+        _errorMessage = "Sorry, try again!";
       }
 
     } catch (e, s) {
-      _errorMessage = "Error generating loop: ${e.toString()}";
-      print(_errorMessage);
-      print('--- STACK TRACE ---');
-      print(s);
+      _errorMessage = "An unexpected error occurred.";
+      // For your own debugging, you might want to uncomment these lines
+      // print("Error generating loop: ${e.toString()}");
+      // print('--- STACK TRACE ---');
+      // print(s);
     } finally {
       _isLoading = false;
       notifyListeners();
@@ -268,8 +254,6 @@ class MapState with ChangeNotifier {
     final double minRadius = 200.0;
     final double maxRadius = targetDistanceMeters * 0.8;
     final double adjustedRadius = roughRadiusMeters.clamp(minRadius, maxRadius);
-
-    print("Generating $numPoints structured waypoints with adjusted radius: ${adjustedRadius.toStringAsFixed(0)}m (Factor: ${radiusFactor.toStringAsFixed(2)})");
 
     const double earthRadius = 6371000.0;
     double initialBearing = random.nextDouble() * 2 * pi;
@@ -292,8 +276,6 @@ class MapState with ChangeNotifier {
     return waypoints;
   }
 
-// lib/map_state.dart
-
   Future<List<LatLng>?> _snapWaypointsToRoads(List<LatLng> waypoints) async {
     final String path = waypoints.map((p) => '${p.latitude},${p.longitude}').join('|');
 
@@ -304,21 +286,14 @@ class MapState with ChangeNotifier {
 
     final Uri url = Uri.https('roads.googleapis.com', '/v1/snapToRoads', queryParams);
 
-    print("Roads API URL: $url");
-
     try {
       final response = await http.get(url);
-
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
-
         if (data.containsKey('snappedPoints')) {
           final List snappedPoints = data['snappedPoints'];
-
-          // --- SAFER PARSING LOGIC ---
           final List<LatLng> validPoints = [];
           for (var point in snappedPoints) {
-            // Check if the point and its location data exist before using them
             if (point != null && point['location'] != null) {
               final location = point['location'];
               if (location['latitude'] != null && location['longitude'] != null) {
@@ -330,22 +305,14 @@ class MapState with ChangeNotifier {
             }
           }
           return validPoints.isNotEmpty ? validPoints : null;
-        } else {
-          _errorMessage = "Roads API Error: ${data['error']?['message'] ?? 'No snapped points returned.'}";
-          print(_errorMessage);
-          return null;
         }
-      } else {
-        _errorMessage = "Roads API HTTP Error: ${response.statusCode}";
-        print(_errorMessage);
-        return null;
       }
     } catch (e) {
-      _errorMessage = "Roads API Network Error: ${e.toString()}";
-      print(_errorMessage);
-      return null;
+      // Fail silently
     }
+    return null;
   }
+
   Future<LatLng?> _findNearbyRestaurant(LatLng searchCenter) async {
     const String placesBaseUrl = "https://maps.googleapis.com/maps/api/place/nearbysearch/json";
     const double searchRadiusMeters = 1500;
@@ -369,17 +336,11 @@ class MapState with ChangeNotifier {
     } else {
       url = Uri.https('maps.googleapis.com', '/maps/api/place/nearbysearch/json', queryParams);
     }
-    print("Places API URL: $url");
 
     try {
       final response = await http.get(url);
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
-        if (useCorsProxy && response.body.contains("Missing required request header")) {
-          _errorMessage = "CORS Proxy Error (Places API): Missing required headers.";
-          print(_errorMessage);
-          return null;
-        }
 
         if ((data['status'] == 'OK' || data['status'] == 'ZERO_RESULTS') && data['results'] != null) {
           if (data['results'].isNotEmpty) {
@@ -389,26 +350,13 @@ class MapState with ChangeNotifier {
                 (location['lat'] as num).toDouble(),
                 (location['lng'] as num).toDouble()
             );
-          } else {
-            print("Places API: Zero results found for restaurants nearby.");
-            _errorMessage = "No open restaurants found near the end of the loop.";
-            return null;
           }
-        } else {
-          _errorMessage = "Places API Error: ${data['status']} ${data['error_message'] ?? ''}";
-          print(_errorMessage);
-          return null;
         }
-      } else {
-        _errorMessage = "Places API HTTP Error: ${response.statusCode} ${response.reasonPhrase}";
-        print(_errorMessage);
-        return null;
       }
     } catch (e) {
-      _errorMessage = "Places API Network/Parsing Error: ${e.toString()}";
-      print(_errorMessage);
-      return null;
+      // Fail silently
     }
+    return null;
   }
 
   Future<Map<String, dynamic>?> _getDirections(
@@ -464,22 +412,12 @@ class MapState with ChangeNotifier {
             'duration_seconds': durationSeconds,
             'bounds': bounds,
           };
-        } else {
-          _errorMessage = "Routes API Error: No routes found.";
-          print(_errorMessage);
-          return null;
         }
-      } else {
-        _errorMessage = "Routes API HTTP Error: ${response.statusCode} - ${response.body}";
-        print(_errorMessage);
-        return null;
       }
-    } catch (e, s) {
-      _errorMessage = "Routes API Network/Parsing Error: ${e.toString()}";
-      print(_errorMessage);
-      print(s);
-      return null;
+    } catch (e) {
+      // Fail silently
     }
+    return null;
   }
 
   void _processRouteResult(Map<String, dynamic> result, List<LatLng> waypoints) {
