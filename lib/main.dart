@@ -22,10 +22,10 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'BikeLoop',
       theme: ThemeData(
-        primarySwatch: Colors.deepPurple, // Match AppBar color
+        primarySwatch: Colors.blueGrey, // Match AppBar color
         visualDensity: VisualDensity.adaptivePlatformDensity,
         useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple), // Use color scheme
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey), // Use color scheme
       ),
       home: const HomeScreen(),
       debugShowCheckedModeBanner: false,

@@ -4,8 +4,8 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/foundation.dart'; // For kIsWeb
 import 'package:flutter/material.dart';
-import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:vector_math/vector_math.dart' as vector;
@@ -18,20 +18,19 @@ class MapState with ChangeNotifier {
   final Set<Marker> _markers = {};
   final Set<Polyline> _polylines = {};
   String _targetDistanceStr = "10";
-  bool _isSmartMode = false;
+  bool _isSmartMode = true;
   bool _isLoading = false;
   String? _errorMessage;
   Map<String, dynamic>? _routeInfo;
   double _currentRadiusFactor = 1.0;
 
-  // *** NEW: State for restaurant feature ***
   bool _endNearRestaurant = false;
-  LatLng? _finalRestaurantLocation; // Store found restaurant location
+  LatLng? _finalRestaurantLocation;
 
   // --- Public Getters ---
   LatLng? get initialCameraPosition => _currentPosition != null
       ? LatLng(_currentPosition!.latitude, _currentPosition!.longitude)
-      : const LatLng(45.6770, -111.0429); // Bozeman fallback
+      : const LatLng(38.5358, -105.9910); // Salida, CO fallback
   Set<Marker> get markers => _markers;
   Set<Polyline> get polylines => _polylines;
   bool get isSmartMode => _isSmartMode;
@@ -39,13 +38,12 @@ class MapState with ChangeNotifier {
   String? get errorMessage => _errorMessage;
   Map<String, dynamic>? get routeInfo => _routeInfo;
   String get targetDistanceStr => _targetDistanceStr;
-  // *** NEW: Getter for restaurant checkbox ***
   bool get endNearRestaurant => _endNearRestaurant;
 
 
   final TextEditingController distanceController = TextEditingController(text: "10");
   static const double _metersPerMile = 1609.34;
-  static const int _maxRetriesSmartMode = 5;
+  static const int _maxRetriesSmartMode = 50;
   static const double _radiusAdjustmentStep = 0.15;
 
 
@@ -72,15 +70,12 @@ class MapState with ChangeNotifier {
     notifyListeners();
   }
 
-  // *** NEW: Method to update restaurant preference ***
   void setEndNearRestaurant(bool value) {
     _endNearRestaurant = value;
     notifyListeners();
   }
 
-
   Future<void> _getCurrentLocation() async {
-    // ... (Keep existing code, ensure it sets _currentPosition) ...
     _isLoading = true;
     _errorMessage = null;
     notifyListeners();
@@ -139,13 +134,12 @@ class MapState with ChangeNotifier {
     }
   }
 
-
   Future<void> generateLoop() async {
     _isLoading = true;
     _errorMessage = null;
     _polylines.clear();
     _routeInfo = null;
-    _finalRestaurantLocation = null; // Reset restaurant location
+    _finalRestaurantLocation = null;
     _markers.removeWhere((m) => m.markerId.value != 'start');
     _currentRadiusFactor = 1.0;
     notifyListeners();
@@ -174,7 +168,7 @@ class MapState with ChangeNotifier {
     try {
       LatLng startPoint = LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
       List<LatLng> generatedWaypoints;
-      List<LatLng> finalWaypoints; // Waypoints used for Directions API
+      List<LatLng> finalWaypoints = [];
       Map<String, dynamic>? result;
       bool routeFound = false;
       int retries = 0;
@@ -182,36 +176,38 @@ class MapState with ChangeNotifier {
       do {
         _markers.removeWhere((m) => m.markerId.value.startsWith('wp_') || m.markerId.value == 'restaurant');
 
-        // *** Generate structured waypoints ***
-        // Generate one less if we need to find a restaurant
         int pointsToGenerate = _endNearRestaurant ? 2 : 3;
         generatedWaypoints = _generateStructuredWaypoints(startPoint, targetDistMeters, _currentRadiusFactor, pointsToGenerate);
 
-        // Clone for modification if needed
-        finalWaypoints = List.from(generatedWaypoints);
+        // --- NEW: Snap generated points to the nearest roads ---
+        final List<LatLng>? snappedWaypoints = await _snapWaypointsToRoads(generatedWaypoints);
 
-        // *** Find restaurant if requested ***
+        if (snappedWaypoints == null) {
+          retries++;
+          print("Waypoint snapping failed. Retrying...");
+          await Future.delayed(const Duration(milliseconds: 150));
+          continue; // Skip to the next iteration of the loop
+        }
+
+        finalWaypoints = List.from(snappedWaypoints);
+
         if (_endNearRestaurant && finalWaypoints.isNotEmpty) {
-          LatLng lastWp = finalWaypoints.removeLast(); // Use location of last planned point as search center
+          LatLng lastWp = finalWaypoints.removeLast();
           _finalRestaurantLocation = await _findNearbyRestaurant(lastWp);
 
           if (_finalRestaurantLocation != null) {
-            finalWaypoints.add(_finalRestaurantLocation!); // Add restaurant location as final waypoint
+            finalWaypoints.add(_finalRestaurantLocation!);
             print("Restaurant found near last waypoint: $_finalRestaurantLocation");
           } else {
-            // Couldn't find restaurant, add original last waypoint back
             finalWaypoints.add(lastWp);
             print("Could not find nearby restaurant, using original last waypoint.");
-            // Optionally set an error message or warning here later
           }
         }
 
-        // Get Directions using the final waypoint list
         result = await _getDirections(startPoint, startPoint, finalWaypoints);
 
-        // --- (Rest of the retry logic based on distance - same as before) ---
         if (result != null) {
-          final double actualDistanceMeters = result['distance_meters'];
+          final double actualDistanceMeters = (result['distance_meters'] as num).toDouble();
           if (!_isSmartMode) {
             routeFound = true;
           } else {
@@ -241,9 +237,7 @@ class MapState with ChangeNotifier {
         }
       } while (!_isSmartMode && !routeFound || _isSmartMode && !routeFound && retries < _maxRetriesSmartMode);
 
-      // --- (Result Processing - same as before, but pass finalWaypoints) ---
       if (routeFound && result != null) {
-        // Pass the final list of waypoints used (might include restaurant)
         _processRouteResult(result, finalWaypoints);
         _animateToRouteBounds(result['bounds']);
       } else if (_isSmartMode && !routeFound) {
@@ -254,44 +248,39 @@ class MapState with ChangeNotifier {
         _errorMessage = "Failed to get route. Check network or API keys.";
       }
 
-    } catch (e) {
+    } catch (e, s) {
       _errorMessage = "Error generating loop: ${e.toString()}";
       print(_errorMessage);
+      print('--- STACK TRACE ---');
+      print(s);
     } finally {
       _isLoading = false;
       notifyListeners();
     }
   }
 
-  // *** NEW: Structured Waypoint Generation ***
   List<LatLng> _generateStructuredWaypoints(LatLng start, double targetDistanceMeters, double radiusFactor, int numPoints) {
     final Random random = Random();
     final List<LatLng> waypoints = [];
 
-    // Base radius calculation (remains a rough estimate)
-    final double baseRadiusFraction = 0.35; // Slightly larger fraction for structured
+    final double baseRadiusFraction = 0.35;
     final double roughRadiusMeters = (targetDistanceMeters * baseRadiusFraction * radiusFactor) / 2;
-    final double minRadius = 200.0; // Min 200m
-    final double maxRadius = targetDistanceMeters * 0.8; // Max radius
+    final double minRadius = 200.0;
+    final double maxRadius = targetDistanceMeters * 0.8;
     final double adjustedRadius = roughRadiusMeters.clamp(minRadius, maxRadius);
 
     print("Generating $numPoints structured waypoints with adjusted radius: ${adjustedRadius.toStringAsFixed(0)}m (Factor: ${radiusFactor.toStringAsFixed(2)})");
 
     const double earthRadius = 6371000.0;
-    double initialBearing = random.nextDouble() * 2 * pi; // Random start direction
+    double initialBearing = random.nextDouble() * 2 * pi;
 
-    // Define angular spread based on number of points
-    // Try to spread points somewhat evenly in a large arc
-    double totalArc = (pi * 1.5); // Spread points over ~270 degrees
+    double totalArc = (pi * 1.5);
     double angleIncrement = totalArc / (numPoints + 1);
 
     for (int i = 0; i < numPoints; i++) {
-      // Calculate bearing for this point
       double currentBearing = initialBearing + (angleIncrement * (i + 1));
-      // Vary distance slightly - maybe points further out are further along loop?
-      double distance = adjustedRadius * (0.6 + (random.nextDouble() * 0.4)); // Skew slightly further out
+      double distance = adjustedRadius * (0.6 + (random.nextDouble() * 0.4));
 
-      // Calculate LatLng based on bearing and distance
       double lat1Rad = vector.radians(start.latitude);
       double lon1Rad = vector.radians(start.longitude);
       double lat2Rad = asin(sin(lat1Rad) * cos(distance / earthRadius) +
@@ -303,25 +292,75 @@ class MapState with ChangeNotifier {
     return waypoints;
   }
 
-  // *** NEW: Find Nearby Restaurant using Places API ***
+// lib/map_state.dart
+
+  Future<List<LatLng>?> _snapWaypointsToRoads(List<LatLng> waypoints) async {
+    final String path = waypoints.map((p) => '${p.latitude},${p.longitude}').join('|');
+
+    final Map<String, String> queryParams = {
+      'path': path,
+      'key': googleApiKey,
+    };
+
+    final Uri url = Uri.https('roads.googleapis.com', '/v1/snapToRoads', queryParams);
+
+    print("Roads API URL: $url");
+
+    try {
+      final response = await http.get(url);
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+
+        if (data.containsKey('snappedPoints')) {
+          final List snappedPoints = data['snappedPoints'];
+
+          // --- SAFER PARSING LOGIC ---
+          final List<LatLng> validPoints = [];
+          for (var point in snappedPoints) {
+            // Check if the point and its location data exist before using them
+            if (point != null && point['location'] != null) {
+              final location = point['location'];
+              if (location['latitude'] != null && location['longitude'] != null) {
+                validPoints.add(LatLng(
+                  (location['latitude'] as num).toDouble(),
+                  (location['longitude'] as num).toDouble(),
+                ));
+              }
+            }
+          }
+          return validPoints.isNotEmpty ? validPoints : null;
+        } else {
+          _errorMessage = "Roads API Error: ${data['error']?['message'] ?? 'No snapped points returned.'}";
+          print(_errorMessage);
+          return null;
+        }
+      } else {
+        _errorMessage = "Roads API HTTP Error: ${response.statusCode}";
+        print(_errorMessage);
+        return null;
+      }
+    } catch (e) {
+      _errorMessage = "Roads API Network Error: ${e.toString()}";
+      print(_errorMessage);
+      return null;
+    }
+  }
   Future<LatLng?> _findNearbyRestaurant(LatLng searchCenter) async {
-    // Places API Nearby Search URL
     const String placesBaseUrl = "https://maps.googleapis.com/maps/api/place/nearbysearch/json";
-    // Search within ~1.5km radius of the last planned point
     const double searchRadiusMeters = 1500;
 
     final Map<String, String> queryParams = {
       'location': '${searchCenter.latitude},${searchCenter.longitude}',
       'radius': searchRadiusMeters.toString(),
       'type': 'restaurant',
-      'opennow': 'true', // Optional: prefer currently open places
-      'key': googleApiKey, // Use the Places API key
-      'rankby': 'prominence' // Rank by prominence within the radius
+      'opennow': 'true',
+      'key': googleApiKey,
+      'rankby': 'prominence'
     };
 
-    // Handle CORS for Places API if needed (same logic as Directions)
-    const bool useCorsProxy = kIsWeb; // Use proxy only on web
-    const String corsProxy = "https://cors-anywhere.herokuapp.com/"; // Example only
+    final bool useCorsProxy = kIsWeb;
+    final String corsProxy = "https://cors-anywhere.herokuapp.com/";
 
     Uri url;
     if (useCorsProxy) {
@@ -330,7 +369,6 @@ class MapState with ChangeNotifier {
     } else {
       url = Uri.https('maps.googleapis.com', '/maps/api/place/nearbysearch/json', queryParams);
     }
-
     print("Places API URL: $url");
 
     try {
@@ -345,13 +383,15 @@ class MapState with ChangeNotifier {
 
         if ((data['status'] == 'OK' || data['status'] == 'ZERO_RESULTS') && data['results'] != null) {
           if (data['results'].isNotEmpty) {
-            // Pick the first result (most prominent)
             final place = data['results'][0];
             final location = place['geometry']['location'];
-            return LatLng(location['lat'], location['lng']);
+            return LatLng(
+                (location['lat'] as num).toDouble(),
+                (location['lng'] as num).toDouble()
+            );
           } else {
             print("Places API: Zero results found for restaurants nearby.");
-            _errorMessage = "No open restaurants found near the end of the loop."; // Set temporary error
+            _errorMessage = "No open restaurants found near the end of the loop.";
             return null;
           }
         } else {
@@ -361,112 +401,83 @@ class MapState with ChangeNotifier {
         }
       } else {
         _errorMessage = "Places API HTTP Error: ${response.statusCode} ${response.reasonPhrase}";
-        if (!useCorsProxy && (response.statusCode == 0 || response.statusCode == null)) {
-          _errorMessage = "Places API Network Error (Code ${response.statusCode}): Potential CORS issue on web.";
-        }
         print(_errorMessage);
         return null;
       }
     } catch (e) {
       _errorMessage = "Places API Network/Parsing Error: ${e.toString()}";
-      if (!useCorsProxy && (e.toString().toLowerCase().contains('cors') || e.toString().toLowerCase().contains('xmlhttprequest'))) {
-        _errorMessage = "Places API Network Error: Likely a CORS issue on web. Needs backend proxy.";
-      }
       print(_errorMessage);
       return null;
     }
   }
 
-
-  // *** MODIFIED: Remove optimize:true from waypoints parameter ***
   Future<Map<String, dynamic>?> _getDirections(
       LatLng origin, LatLng destination, List<LatLng> waypoints) async {
 
-    // (CORS Proxy logic remains the same as previous answer - useCorsProxy flag)
-    const bool useCorsProxy = kIsWeb; // Set based on target platform/strategy
-    const String corsProxy = "https://cors-anywhere.herokuapp.com/";
+    const String url = 'https://routes.googleapis.com/directions/v2:computeRoutes';
 
-    // *** Construct waypoints string WITHOUT optimize:true ***
-    final String waypointsString = waypoints
-        .map((wp) => 'via:${wp.latitude},${wp.longitude}')
-        .join('|');
-
-    final Map<String, String> queryParams = {
-      'origin': '${origin.latitude},${origin.longitude}',
-      'destination': '${destination.latitude},${destination.longitude}',
-      // *** Only include waypoints if list is not empty ***
-      if (waypointsString.isNotEmpty) 'waypoints': waypointsString,
-      'mode': 'bicycling',
-      'key': googleApiKey,
+    final Map<String, dynamic> requestBody = {
+      'origin': {'location': {'latLng': {'latitude': origin.latitude, 'longitude': origin.longitude}}},
+      'destination': {'location': {'latLng': {'latitude': destination.latitude, 'longitude': destination.longitude}}},
+      'intermediates': waypoints.map((wp) => {'location': {'latLng': {'latitude': wp.latitude, 'longitude': wp.longitude}}}).toList(),
+      'travelMode': 'BICYCLE',
     };
 
-    Uri url;
-    if (useCorsProxy) {
-      final String googleUrl = Uri.https('maps.googleapis.com', '/maps/api/directions/json', queryParams).toString();
-      url = Uri.parse(corsProxy + googleUrl.substring(8));
-    } else {
-      url = Uri.https('maps.googleapis.com', '/maps/api/directions/json', queryParams);
-    }
-
-    print("Directions API URL (No Optimize): $url");
+    final Map<String, String> headers = {
+      'Content-Type': 'application/json',
+      'X-Goog-Api-Key': googleApiKey,
+      'X-Goog-FieldMask': 'routes.duration,routes.distanceMeters,routes.polyline,routes.viewport',
+    };
 
     try {
-      // (Rest of the http.get and response handling is the same as previous answer)
-      final response = await http.get(url);
+      final response = await http.post(
+        Uri.parse(url),
+        headers: headers,
+        body: json.encode(requestBody),
+      );
+
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
-        if (useCorsProxy && response.body.contains("Missing required request header")) {
-          _errorMessage = "CORS Proxy Error (Directions): Missing required headers.";
-          print(_errorMessage);
-          return null;
-        }
-        // ... (handle OK, ZERO_RESULTS, other statuses)
-        if (data['status'] == 'OK' && data['routes'].isNotEmpty) {
+
+        if (data['routes'] != null && (data['routes'] as List).isNotEmpty) {
           final route = data['routes'][0];
-          int totalDistanceMeters = 0;
-          int totalDurationSeconds = 0;
-          int totalTurns = 0;
-          for (var leg in route['legs']) {
-            totalDistanceMeters += leg['distance']['value'] as int;
-            totalDurationSeconds += leg['duration']['value'] as int;
-            totalTurns += (leg['steps'] as List).length;
-          }
-          String polylinePoints = route['overview_polyline']['points'];
-          LatLngBounds bounds = LatLngBounds(
-            southwest: LatLng(route['bounds']['southwest']['lat'], route['bounds']['southwest']['lng']),
-            northeast: LatLng(route['bounds']['northeast']['lat'], route['bounds']['northeast']['lng']),
+
+          final String durationStr = route['duration'];
+          final int durationSeconds = int.parse(durationStr.replaceAll('s', ''));
+
+          final String polylinePoints = route['polyline']['encodedPolyline'];
+
+          final LatLngBounds bounds = LatLngBounds(
+            southwest: LatLng(
+              (route['viewport']['low']['latitude'] as num).toDouble(),
+              (route['viewport']['low']['longitude'] as num).toDouble(),
+            ),
+            northeast: LatLng(
+              (route['viewport']['high']['latitude'] as num).toDouble(),
+              (route['viewport']['high']['longitude'] as num).toDouble(),
+            ),
           );
+
           return {
             'polyline_points': polylinePoints,
-            'distance_meters': totalDistanceMeters,
-            'duration_seconds': totalDurationSeconds,
-            'turns': totalTurns,
+            'distance_meters': route['distanceMeters'],
+            'duration_seconds': durationSeconds,
             'bounds': bounds,
           };
-
         } else {
-          _errorMessage = "Directions API Error: ${data['status']} ${data['error_message'] ?? ''}";
-          if (data['status'] == 'ZERO_RESULTS') {
-            _errorMessage = "Directions API Error: Could not find a bike route for the generated points.";
-          }
+          _errorMessage = "Routes API Error: No routes found.";
           print(_errorMessage);
           return null;
         }
-
       } else {
-        _errorMessage = "Directions HTTP Error: ${response.statusCode} ${response.reasonPhrase}";
-        if (!useCorsProxy && (response.statusCode == 0 || response.statusCode == null)) {
-          _errorMessage = "Directions Network Error (Code ${response.statusCode}): Potential CORS issue on web.";
-        }
+        _errorMessage = "Routes API HTTP Error: ${response.statusCode} - ${response.body}";
         print(_errorMessage);
         return null;
       }
-    } catch (e) {
-      _errorMessage = "Directions Network/Parsing Error: ${e.toString()}";
-      if (!useCorsProxy && (e.toString().toLowerCase().contains('cors') || e.toString().toLowerCase().contains('xmlhttprequest'))) {
-        _errorMessage = "Directions Network Error: Likely a CORS issue on web. Needs backend proxy.";
-      }
+    } catch (e, s) {
+      _errorMessage = "Routes API Network/Parsing Error: ${e.toString()}";
       print(_errorMessage);
+      print(s);
       return null;
     }
   }
@@ -477,23 +488,19 @@ class MapState with ChangeNotifier {
 
     Polyline routePolyline = Polyline(
       polylineId: const PolylineId('route'),
-      color: Colors.blueAccent, // Changed color slightly
+      color: Colors.blueAccent,
       points: polylineCoordinates,
       width: 5,
     );
-    // Clear previous polylines before adding new one
     _polylines.clear();
     _polylines.add(routePolyline);
 
     _routeInfo = {
       'distance': (result['distance_meters'] / _metersPerMile).toStringAsFixed(1),
       'time': (result['duration_seconds'] / 60).toStringAsFixed(0),
-      'turns': result['turns'],
     };
 
-    // Add markers for the intermediate waypoints used (excluding start/end)
     for (int i = 0; i < waypoints.length; i++) {
-      // Check if this waypoint is the restaurant location
       bool isRestaurant = _finalRestaurantLocation != null &&
           waypoints[i].latitude == _finalRestaurantLocation!.latitude &&
           waypoints[i].longitude == _finalRestaurantLocation!.longitude;
