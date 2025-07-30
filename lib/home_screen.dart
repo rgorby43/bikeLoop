@@ -174,7 +174,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         padding: const EdgeInsets.only(top: 8.0),
                         child: Text(
                           mapState.errorMessage!,
-                          style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold),
+                          style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
                           textAlign: TextAlign.center,
                         ),
                       ),

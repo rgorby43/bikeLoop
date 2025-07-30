@@ -289,7 +289,7 @@ class MapState with ChangeNotifier {
         _processRouteResult(result, finalWaypoints);
         _animateToRouteBounds(result['bounds']);
       } else {
-        _errorMessage = "Sorry, couldn't generate a loop. Try a different distance or starting point.";
+        _errorMessage = "Sorry, give it another try";
       }
     } catch (e) {
       _errorMessage = "An unexpected error occurred.";
