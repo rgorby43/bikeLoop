@@ -66,7 +66,7 @@ class MapState with ChangeNotifier {
   void onMapCreated(GoogleMapController controller) {
     _mapController = controller;
     if (_currentPosition != null) {
-      _animateToUser();
+      animateToUser();
     }
   }
 
@@ -104,7 +104,7 @@ class MapState with ChangeNotifier {
             LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
             'Start/End (Your Location)');
         if (_mapController != null) {
-          _animateToUser();
+          animateToUser();
         }
       } else if (_currentPosition == null) {
         throw Exception("Failed to get current position.");
@@ -165,14 +165,14 @@ class MapState with ChangeNotifier {
       _updateStartMarker(
           LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
           'Start/End (Your Location)');
-      _animateToUser();
+      animateToUser();
     } else {
       _markers.removeWhere((m) => m.markerId.value == 'start');
     }
     notifyListeners();
   }
 
-  void _animateToUser() {
+  void animateToUser() {
     if (_mapController != null && _currentPosition != null) {
       _mapController!.animateCamera(
         CameraUpdate.newCameraPosition(
