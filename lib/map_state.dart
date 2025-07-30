@@ -1,14 +1,15 @@
-// lib/map_state.dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'package:flutter/foundation.dart'; // For kIsWeb
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:vector_math/vector_math.dart' as vector;
+import 'package:url_launcher/url_launcher.dart';
+import 'package:geocoding/geocoding.dart';
 import 'secrets.dart';
 
 class MapState with ChangeNotifier {
@@ -23,9 +24,15 @@ class MapState with ChangeNotifier {
   String? _errorMessage;
   Map<String, dynamic>? _routeInfo;
   double _currentRadiusFactor = 1.0;
-
   bool _endNearRestaurant = false;
   LatLng? _finalRestaurantLocation;
+
+  // --- State for new features ---
+  LatLng? _customStartLocation;
+  LatLng? _lastGeneratedStartPoint;
+  List<LatLng> _lastGeneratedWaypoints = [];
+  final TextEditingController customStartController = TextEditingController();
+  final TextEditingController distanceController = TextEditingController(text: "10");
 
   // --- Public Getters ---
   LatLng? get initialCameraPosition => _currentPosition != null
@@ -40,12 +47,10 @@ class MapState with ChangeNotifier {
   String get targetDistanceStr => _targetDistanceStr;
   bool get endNearRestaurant => _endNearRestaurant;
 
-
-  final TextEditingController distanceController = TextEditingController(text: "10");
+  // --- Constants ---
   static const double _metersPerMile = 1609.34;
   static const int _maxRetriesSmartMode = 50;
   static const double _radiusAdjustmentStep = 0.15;
-
 
   MapState() {
     _init();
@@ -94,29 +99,77 @@ class MapState with ChangeNotifier {
 
       _currentPosition = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
 
-      _markers.clear();
-      if (_currentPosition != null) {
-        _markers.add(
-          Marker(
-            markerId: const MarkerId('start'),
-            position: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
-            infoWindow: const InfoWindow(title: 'Start/End'),
-            icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
-          ),
-        );
+      if (_customStartLocation == null && _currentPosition != null) {
+        _updateStartMarker(
+            LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+            'Start/End (Your Location)');
         if (_mapController != null) {
           _animateToUser();
         }
-      } else {
+      } else if (_currentPosition == null) {
         throw Exception("Failed to get current position.");
       }
-
     } catch (e) {
       _errorMessage = e.toString();
     } finally {
       _isLoading = false;
       notifyListeners();
     }
+  }
+
+  void _updateStartMarker(LatLng position, String title) {
+    _markers.removeWhere((m) => m.markerId.value == 'start');
+    _markers.add(
+      Marker(
+        markerId: const MarkerId('start'),
+        position: position,
+        infoWindow: InfoWindow(title: title),
+        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
+      ),
+    );
+  }
+
+  Future<void> setCustomStartLocation(LatLng position) async {
+    _isLoading = true;
+    notifyListeners();
+    try {
+      _customStartLocation = position;
+      List<Placemark> placemarks = await placemarkFromCoordinates(
+        position.latitude,
+        position.longitude,
+      );
+
+      if (placemarks.isNotEmpty) {
+        final p = placemarks.first;
+        customStartController.text = "${p.street}, ${p.locality}";
+      } else {
+        customStartController.text = "Custom Location Selected";
+      }
+
+      _updateStartMarker(position, 'Custom Start/End');
+      _mapController?.animateCamera(CameraUpdate.newLatLng(position));
+
+    } catch (e) {
+      customStartController.text = "Address not found";
+      _updateStartMarker(position, 'Custom Start/End');
+    } finally {
+      _isLoading = false;
+      notifyListeners();
+    }
+  }
+
+  void clearCustomStartLocation() {
+    _customStartLocation = null;
+    customStartController.clear();
+    if (_currentPosition != null) {
+      _updateStartMarker(
+          LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+          'Start/End (Your Location)');
+      _animateToUser();
+    } else {
+      _markers.removeWhere((m) => m.markerId.value == 'start');
+    }
+    notifyListeners();
   }
 
   void _animateToUser() {
@@ -140,17 +193,25 @@ class MapState with ChangeNotifier {
     _finalRestaurantLocation = null;
     _markers.removeWhere((m) => m.markerId.value != 'start');
     _currentRadiusFactor = 1.0;
+    _lastGeneratedStartPoint = null;
+    _lastGeneratedWaypoints.clear();
     notifyListeners();
 
-    if (_currentPosition == null) {
+    final LatLng? startPoint = _customStartLocation ?? (_currentPosition != null
+        ? LatLng(_currentPosition!.latitude, _currentPosition!.longitude)
+        : null);
+
+    if (startPoint == null) {
       await _getCurrentLocation();
       if (_currentPosition == null) {
-        _errorMessage = "Could not get your location. Please enable location services.";
+        _errorMessage = "Could not get your location. Please enable location services or select a custom start point by long-pressing on the map.";
         _isLoading = false;
         notifyListeners();
         return;
       }
     }
+
+    final LatLng effectiveStartPoint = _customStartLocation ?? LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
 
     final double? targetDistMiles = double.tryParse(distanceController.text);
     if (targetDistMiles == null || targetDistMiles <= 0) {
@@ -162,7 +223,6 @@ class MapState with ChangeNotifier {
     final double targetDistMeters = targetDistMiles * _metersPerMile;
 
     try {
-      LatLng startPoint = LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
       List<LatLng> generatedWaypoints;
       List<LatLng> finalWaypoints = [];
       Map<String, dynamic>? result;
@@ -171,10 +231,8 @@ class MapState with ChangeNotifier {
 
       do {
         _markers.removeWhere((m) => m.markerId.value.startsWith('wp_') || m.markerId.value == 'restaurant');
-
         int pointsToGenerate = _endNearRestaurant ? 2 : 3;
-        generatedWaypoints = _generateStructuredWaypoints(startPoint, targetDistMeters, _currentRadiusFactor, pointsToGenerate);
-
+        generatedWaypoints = _generateStructuredWaypoints(effectiveStartPoint, targetDistMeters, _currentRadiusFactor, pointsToGenerate);
         final List<LatLng>? snappedWaypoints = await _snapWaypointsToRoads(generatedWaypoints);
 
         if (snappedWaypoints == null) {
@@ -196,7 +254,7 @@ class MapState with ChangeNotifier {
           }
         }
 
-        result = await _getDirections(startPoint, startPoint, finalWaypoints);
+        result = await _getDirections(effectiveStartPoint, effectiveStartPoint, finalWaypoints);
 
         if (result != null) {
           final double actualDistanceMeters = (result['distance_meters'] as num).toDouble();
@@ -226,21 +284,52 @@ class MapState with ChangeNotifier {
       } while (!_isSmartMode && !routeFound || _isSmartMode && !routeFound && retries < _maxRetriesSmartMode);
 
       if (routeFound && result != null) {
+        _lastGeneratedStartPoint = effectiveStartPoint;
+        _lastGeneratedWaypoints = finalWaypoints;
         _processRouteResult(result, finalWaypoints);
         _animateToRouteBounds(result['bounds']);
       } else {
-        // --- UPDATED: Final error message ---
-        _errorMessage = "Sorry, try again!";
+        _errorMessage = "Sorry, couldn't generate a loop. Try a different distance or starting point.";
       }
-
-    } catch (e, s) {
+    } catch (e) {
       _errorMessage = "An unexpected error occurred.";
-      // For your own debugging, you might want to uncomment these lines
-      // print("Error generating loop: ${e.toString()}");
-      // print('--- STACK TRACE ---');
-      // print(s);
     } finally {
       _isLoading = false;
+      notifyListeners();
+    }
+  }
+
+  // Replace your function with this final version.
+  Future<void> startNavigation() async {
+    if (_lastGeneratedStartPoint == null) {
+      _errorMessage = "No route has been generated yet.";
+      notifyListeners();
+      return;
+    }
+
+    final LatLng origin = _lastGeneratedStartPoint!;
+    final LatLng destination = _lastGeneratedStartPoint!; // Loop returns to origin
+    final List<LatLng> waypoints = _lastGeneratedWaypoints;
+
+    // This is the official, universal URL format for multi-stop routes.
+    // On a phone with Google Maps installed, it will open in the app.
+    // Otherwise, it will open in the browser.
+    final Uri uri = Uri.https('www.google.com', '/maps/dir/', {
+      'api': '1',
+      'origin': '${origin.latitude},${origin.longitude}',
+      'destination': '${destination.latitude},${destination.longitude}',
+      'waypoints': waypoints.map((p) => '${p.latitude},${p.longitude}').join('|'),
+      'travelmode': 'bicycling',
+    });
+
+    try {
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } else {
+        throw 'Could not launch $uri';
+      }
+    } catch (e) {
+      _errorMessage = "Could not launch Google Maps.";
       notifyListeners();
     }
   }
@@ -278,12 +367,10 @@ class MapState with ChangeNotifier {
 
   Future<List<LatLng>?> _snapWaypointsToRoads(List<LatLng> waypoints) async {
     final String path = waypoints.map((p) => '${p.latitude},${p.longitude}').join('|');
-
     final Map<String, String> queryParams = {
       'path': path,
       'key': googleApiKey,
     };
-
     final Uri url = Uri.https('roads.googleapis.com', '/v1/snapToRoads', queryParams);
 
     try {
@@ -316,7 +403,6 @@ class MapState with ChangeNotifier {
   Future<LatLng?> _findNearbyRestaurant(LatLng searchCenter) async {
     const String placesBaseUrl = "https://maps.googleapis.com/maps/api/place/nearbysearch/json";
     const double searchRadiusMeters = 1500;
-
     final Map<String, String> queryParams = {
       'location': '${searchCenter.latitude},${searchCenter.longitude}',
       'radius': searchRadiusMeters.toString(),
@@ -325,11 +411,10 @@ class MapState with ChangeNotifier {
       'key': googleApiKey,
       'rankby': 'prominence'
     };
-
     final bool useCorsProxy = kIsWeb;
     final String corsProxy = "https://cors-anywhere.herokuapp.com/";
-
     Uri url;
+
     if (useCorsProxy) {
       final String googleUrl = Uri.https('maps.googleapis.com', '/maps/api/place/nearbysearch/json', queryParams).toString();
       url = Uri.parse(corsProxy + googleUrl.substring(8));
@@ -341,7 +426,6 @@ class MapState with ChangeNotifier {
       final response = await http.get(url);
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
-
         if ((data['status'] == 'OK' || data['status'] == 'ZERO_RESULTS') && data['results'] != null) {
           if (data['results'].isNotEmpty) {
             final place = data['results'][0];
@@ -361,16 +445,13 @@ class MapState with ChangeNotifier {
 
   Future<Map<String, dynamic>?> _getDirections(
       LatLng origin, LatLng destination, List<LatLng> waypoints) async {
-
     const String url = 'https://routes.googleapis.com/directions/v2:computeRoutes';
-
     final Map<String, dynamic> requestBody = {
       'origin': {'location': {'latLng': {'latitude': origin.latitude, 'longitude': origin.longitude}}},
       'destination': {'location': {'latLng': {'latitude': destination.latitude, 'longitude': destination.longitude}}},
       'intermediates': waypoints.map((wp) => {'location': {'latLng': {'latitude': wp.latitude, 'longitude': wp.longitude}}}).toList(),
       'travelMode': 'BICYCLE',
     };
-
     final Map<String, String> headers = {
       'Content-Type': 'application/json',
       'X-Goog-Api-Key': googleApiKey,
@@ -386,15 +467,11 @@ class MapState with ChangeNotifier {
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
-
         if (data['routes'] != null && (data['routes'] as List).isNotEmpty) {
           final route = data['routes'][0];
-
           final String durationStr = route['duration'];
           final int durationSeconds = int.parse(durationStr.replaceAll('s', ''));
-
           final String polylinePoints = route['polyline']['encodedPolyline'];
-
           final LatLngBounds bounds = LatLngBounds(
             southwest: LatLng(
               (route['viewport']['low']['latitude'] as num).toDouble(),
@@ -423,7 +500,6 @@ class MapState with ChangeNotifier {
   void _processRouteResult(Map<String, dynamic> result, List<LatLng> waypoints) {
     List<PointLatLng> decodedPoints = PolylinePoints().decodePolyline(result['polyline_points']);
     List<LatLng> polylineCoordinates = decodedPoints.map((p) => LatLng(p.latitude, p.longitude)).toList();
-
     Polyline routePolyline = Polyline(
       polylineId: const PolylineId('route'),
       color: Colors.blueAccent,
@@ -465,6 +541,7 @@ class MapState with ChangeNotifier {
   @override
   void dispose() {
     distanceController.dispose();
+    customStartController.dispose();
     super.dispose();
   }
 }
